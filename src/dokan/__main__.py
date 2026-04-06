@@ -639,7 +639,10 @@ def main() -> None:
         if args.local_cores is not None:
             local_ncores = max(2, args.local_cores)
 
-        nworkers: int = max(cpu_count, nactive_part) + 1
+        # Keep Luigi worker fanout aligned with the local resource budget.
+        # On large submit hosts, spawning one worker per visible CPU can overwhelm
+        # the SQLite-backed run database long before Condor becomes the bottleneck.
+        nworkers: int = max(2, min(max(cpu_count, nactive_part) + 1, local_ncores + 1))
         config["run"]["jobs_batch_size"] = max(
             2 * (jobs_max // nactive_part) + 1,
             config["run"]["jobs_batch_unit_size"],
@@ -655,6 +658,17 @@ def main() -> None:
 
         # > actually submit the root task to run NNLOJET and spawn the monitor
         # > pass config since it changed w.r.t. db_init
+        scheduler_retry_delay: float = 5.0
+        if config["exe"]["policy"] == ExecutionPolicy.HTCONDOR:
+            scheduler_retry_delay = min(
+                scheduler_retry_delay,
+                max(1.0, config["exe"]["policy_settings"]["htcondor_poll_time"]),
+            )
+        if config["exe"]["policy"] == ExecutionPolicy.SLURM:
+            scheduler_retry_delay = min(
+                scheduler_retry_delay,
+                max(1.0, config["exe"]["policy_settings"]["slurm_poll_time"]),
+            )
         luigi_result = luigi.build(
             [
                 db_init.clone(Entry, config=config, resurrect=resurrect),
@@ -672,6 +686,8 @@ def main() -> None:
                 cache_task_completion=False,  # needed for MergePart
                 check_complete_on_run=False,
                 check_unfulfilled_deps=True,
+                retry_external_tasks=True,
+                retry_delay=scheduler_retry_delay,
                 wait_interval=0.1,
             ),
             detailed_summary=True,
@@ -772,6 +788,7 @@ def main() -> None:
                 cache_task_completion=False,
                 check_complete_on_run=False,
                 check_unfulfilled_deps=True,
+                retry_external_tasks=True,
                 wait_interval=0.1,
             ),
             detailed_summary=True,

@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..exe import ExecutionMode, ExecutionPolicy, Executor, ExeData
+from ..exe.htcondor import HTCondorTracker
 from ..runcard import RuncardTemplate
 from ._dbmerge import MergePart
 from ._dbtask import DBTask
@@ -230,7 +231,18 @@ class DBRunner(DBTask):
             if job_status == JobStatus.DISPATCHED and not exe_data.is_final:
                 self._prepare_execution(session, db_jobs, exe_data)
 
-            # > Yield Executor
+            if self.policy == ExecutionPolicy.HTCONDOR:
+                # HTCondor submission returns immediately; use a dedicated DB
+                # finalizer task so Luigi does not need to resume this dynamic
+                # dependency chain to update terminal job states.
+                self._debug(
+                    session,
+                    self._logger_prefix + f"::run:  yield HTCondorFinalize {exe_data['jobs']}",
+                )
+                yield self.clone(HTCondorFinalize)
+                return
+
+            # > Yield backend execution.
             self._debug(
                 session,
                 self._logger_prefix + f"::run:  yield Executor {exe_data['jobs']}",
@@ -270,3 +282,49 @@ class DBRunner(DBTask):
                 else:
                     self._logger(session, self._logger_prefix + "::run:  yield MergePart")
                     yield mrg_part
+
+
+class HTCondorFinalize(DBRunner):
+    """Update the DB after a non-blocking HTCondor submission completes."""
+
+    priority = 11
+
+    def requires(self):
+        return [
+            HTCondorTracker(
+                path=str(self.job_path.absolute()),
+            )
+        ]
+
+    def run(self):
+        exe_data = ExeData(self.job_path)
+        exe_data.load()
+        if not exe_data.is_final:
+            raise RuntimeError(f"{self.ids} not final?!\n{self.job_path}\n{exe_data.data}")
+
+        with self.session as session:
+            self._logger(
+                session,
+                self._logger_prefix + f"::HTCondorFinalize:  [dim](job_ids = {self.ids})[/dim]",
+            )
+            db_jobs: list[Job] = [session.get_one(Job, job_id) for job_id in self.ids]
+
+            exe_log: Path = exe_data.path / Executor._file_log
+            if exe_log.exists():
+                with open(exe_log) as f:
+                    self._logger(
+                        session,
+                        self._logger_prefix
+                        + f"::HTCondorFinalize: Executor log [dim]({exe_log})[/dim]:\n"
+                        + "\n".join(f" | [dim]{ln.strip()}[/dim]" for ln in f.readlines()),
+                    )
+
+            self._process_results(session, db_jobs, exe_data)
+
+            if self.mode == ExecutionMode.PRODUCTION:
+                mrg_part = self.clone(MergePart, force=False, part_id=self.part_id)
+                if mrg_part.complete():
+                    self._debug(session, self._logger_prefix + "::HTCondorFinalize:  MergePart complete")
+                    return
+                self._logger(session, self._logger_prefix + "::HTCondorFinalize:  yield MergePart")
+                yield mrg_part

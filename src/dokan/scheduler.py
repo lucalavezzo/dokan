@@ -1,4 +1,34 @@
+import os
+
 from luigi import rpc, scheduler, worker
+from luigi.event import Event
+
+
+def _patch_retry_logging() -> None:
+    """Downgrade expected retry conditions from traceback noise to info logs."""
+    if getattr(worker.TaskProcess, "_dokan_retry_logging_patched", False):
+        return
+
+    original = worker.TaskProcess._handle_run_exception
+
+    def _handle_run_exception(self, ex):
+        if getattr(ex, "dokan_retry_no_trace", False):
+            worker.logger.info(
+                "[pid %s] Worker %s retrying  %s: %s",
+                os.getpid(),
+                self.worker_id,
+                self.task,
+                ex,
+            )
+            self.task.trigger_event(Event.FAILURE, self.task, ex)
+            return self.task.on_failure(ex)
+        return original(self, ex)
+
+    worker.TaskProcess._handle_run_exception = _handle_run_exception
+    worker.TaskProcess._dokan_retry_logging_patched = True
+
+
+_patch_retry_logging()
 
 
 class WorkerSchedulerFactory:
@@ -17,6 +47,8 @@ class WorkerSchedulerFactory:
         self.cache_task_completion = kwargs.pop("cache_task_completion", False)
         self.check_complete_on_run = kwargs.pop("check_complete_on_run", False)
         self.check_unfulfilled_deps = kwargs.pop("check_unfulfilled_deps", True)
+        self.retry_external_tasks = kwargs.pop("retry_external_tasks", False)
+        self.retry_delay = kwargs.pop("retry_delay", None)
         self.wait_interval = kwargs.pop("wait_interval", 0.1)  # luigi default: 1.0
         self.wait_jitter = kwargs.pop("wait_jitter", 0.5)  # luigi default: 5.0
         self.ping_interval = kwargs.pop("ping_interval", 0.1)  # luigi default: 1.0
@@ -25,9 +57,14 @@ class WorkerSchedulerFactory:
             raise RuntimeError(f"WorkerSchedulerFactory: left-over options {kwargs}")
 
     def create_local_scheduler(self):
-        return scheduler.Scheduler(
-            prune_on_get_work=True, record_task_history=False, resources=self.resources
-        )
+        scheduler_kwargs = {
+            "prune_on_get_work": True,
+            "record_task_history": False,
+            "resources": self.resources,
+        }
+        if self.retry_delay is not None:
+            scheduler_kwargs["retry_delay"] = self.retry_delay
+        return scheduler.Scheduler(**scheduler_kwargs)
 
     def create_remote_scheduler(self, url):
         return rpc.RemoteScheduler(url)
@@ -40,6 +77,7 @@ class WorkerSchedulerFactory:
             cache_task_completion=self.cache_task_completion,
             check_complete_on_run=self.check_complete_on_run,
             check_unfulfilled_deps=self.check_unfulfilled_deps,
+            retry_external_tasks=self.retry_external_tasks,
             wait_interval=self.wait_interval,
             wait_jitter=self.wait_jitter,
             ping_interval=self.ping_interval,

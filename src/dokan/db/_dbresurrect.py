@@ -11,7 +11,8 @@ import luigi
 
 from dokan.db._loglevel import LogLevel
 
-from ..exe import Executor, ExeData
+from ..exe import ExecutionPolicy, Executor, ExeData
+from ..exe.htcondor import HTCondorTracker
 from ._dbtask import DBTask
 from ._jobstatus import JobStatus
 from ._sqla import Job
@@ -51,12 +52,13 @@ class DBResurrect(DBTask):
             return []
         with self.session as session:
             self._debug(session, f"DBResurrect::requires:  rel_path = {self.rel_path}")
-        return [
-            Executor.factory(
-                policy=self.exe_data["policy"],
-                path=str(self.exe_data.path.absolute()),
-            )
-        ]
+        if self.exe_data["policy"] == ExecutionPolicy.HTCONDOR:
+            return [HTCondorTracker(path=str(self.exe_data.path.absolute()))]
+        exec_task = Executor.factory(
+            policy=self.exe_data["policy"],
+            path=str(self.exe_data.path.absolute()),
+        )
+        return [exec_task]
 
     def complete(self) -> bool:
         """Check if all jobs in this resurrection context are terminated.
