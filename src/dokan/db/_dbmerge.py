@@ -18,6 +18,8 @@ import luigi
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+_DAT_PATTERN = re.compile(r"^.*\.([^.]+)\.s[0-9]+\.dat$")
+
 from .._types import GenericPath
 from ..combine import NNLOJETContainer, NNLOJETHistogram
 from ..exe._exe_config import ExecutionMode
@@ -231,6 +233,10 @@ class MergePart(DBMerge):
             # > collect histograms from all jobs
             pt.Ttot = 0.0
             pt.ntot = 0
+            _t_collect_start = time.time()
+            _n_jobs = 0
+            _in_files_set = set(in_files.keys())
+            _seen_paths: set[str] = set()
             for job in session.scalars(self.select_job):
                 if not job.rel_path:
                     continue  # @todo raise warning in logger?
@@ -240,12 +246,20 @@ class MergePart(DBMerge):
                 )
                 pt.Ttot += job.elapsed_time
                 pt.ntot += job.niter * job.ncall
+                job.status = JobStatus.MERGED
+                _n_jobs += 1
+                # > with batched seeds (jobs_batch_size > 1) multiple DB rows
+                # > share the same rel_path and job.json; only collect files once
+                if job.rel_path in _seen_paths:
+                    continue
+                _seen_paths.add(job.rel_path)
                 job_path: Path = self._path / job.rel_path
                 exe_data = ExeData(job_path)
                 if raw_path is not None:
                     (raw_path / job.rel_path).mkdir(parents=True, exist_ok=True)
 
-                for out in exe_data["output_files"]:
+                _job_rel_str = str(job_path.relative_to(self._path))
+                for out in exe_data.get("output_files", []):
                     # > move to raw path
                     if raw_path is not None:
                         orig_file: Path = job_path / out
@@ -253,17 +267,22 @@ class MergePart(DBMerge):
                         if orig_file.exists() and not orig_file.is_symlink():
                             shutil.move(orig_file, dest_file)
                             orig_file.symlink_to(dest_file)
-                    if dat := re.match(r"^.*\.([^.]+)\.s[0-9]+\.dat", out):
-                        if dat.group(1) in in_files:
-                            in_files[dat.group(1)].append(str((job_path / out).relative_to(self._path)))
+                    if dat := _DAT_PATTERN.match(out):
+                        _obs = dat.group(1)
+                        if _obs in _in_files_set:
+                            in_files[_obs].append(_job_rel_str + "/" + out)
                         else:
                             self._logger(
                                 session,
                                 self._logger_prefix
                                 + "::run:  "
-                                + f"unmatched observable {dat.group(1)}?! ({in_files.keys()})",
+                                + f"unmatched observable {_obs}?! ({in_files.keys()})",
                             )
-                job.status = JobStatus.MERGED
+            _t_collect_end = time.time()
+            self._logger(
+                session,
+                self._logger_prefix + f"::run:  TIMING collect: {_t_collect_end - _t_collect_start:.1f}s for {_n_jobs} jobs",
+            )
             if single_file:
                 # > unroll the single histogram to all registered observables
                 singles: list[GenericPath] = in_files.pop(single_file)
@@ -290,13 +309,19 @@ class MergePart(DBMerge):
             # > merge all histograms
             # > keep track of all cross section estimates (also as sums over distributions)
             cross_list: list[tuple[float, float]] = []
+            _t_merge_start = time.time()
+            _n_files_total = 0
+
             for obs, hist_info in self.config["run"]["histograms"].items():
                 out_file: Path = mrg_path / f"{obs}.dat"
                 nx: int = hist_info["nx"]
                 qwgt: bool = self.grids and (hist_info.get("grid") is not None)
-                container = NNLOJETContainer(size=len(in_files[obs]), weights=qwgt)
                 obs_name: str | None = obs if single_file else None
-                for in_file in in_files[obs]:
+                file_list = in_files[obs]
+                _n_files_total += len(file_list)
+
+                container = NNLOJETContainer(size=len(file_list), weights=qwgt)
+                for in_file in file_list:
                     try:
                         container.append(
                             NNLOJETHistogram(
@@ -312,6 +337,7 @@ class MergePart(DBMerge):
                             f"error reading file {in_file} ({e!r})",
                             level=LogLevel.ERROR,
                         )
+
                 container.mask_outliers(
                     self.config["merge"]["trim_threshold"],
                     self.config["merge"]["trim_max_fraction"],
@@ -373,6 +399,12 @@ class MergePart(DBMerge):
                 # if err > pt.error:
                 #     pt.error = err
 
+            _t_merge_end = time.time()
+            self._logger(
+                session,
+                self._logger_prefix + f"::run:  TIMING merge total: {_t_merge_end - _t_merge_start:.1f}s ({_n_files_total} files)",
+            )
+
             opt_target: str = self.config["run"]["opt_target"]
 
             # > different estimates for the relative cross uncertainties
@@ -395,6 +427,12 @@ class MergePart(DBMerge):
                 raise ValueError(self._logger_prefix + f"::run:  unknown opt_target {opt_target}")
             # > override with registered error with the optimization target
             pt.error = abs(rel_cross_err * pt.result)
+
+            _t_total = time.time() - _t_collect_start
+            self._logger(
+                session,
+                self._logger_prefix + f"::run:  DONE in {_t_total:.1f}s — {pt.name}: result={pt.result:.4g} +/- {rel_cross_err*100:.2f}%",
+            )
 
             self._safe_commit(session)
 
