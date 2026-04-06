@@ -5,12 +5,116 @@ import re
 import sys
 
 import numpy as np
+import numba
 
 from ._algo import is_outlier_dynMAD
 
 _comment_prefix = "#"
 
 logger = logging.getLogger("luigi-interface")
+
+
+@numba.jit(nopython=True, cache=True)
+def _kopt_inner(yval, yerr, mask, neval_orig, n_rows, n_cols, n_files, maxdev_steps, nsteps):
+    """Numba-accelerated inner loop of optimise_k."""
+    for i_row in range(n_rows):
+        for i_col in range(n_cols):
+            neval = neval_orig.copy()
+            history_y = np.empty(n_files, dtype=np.float64)
+            history_e = np.empty(n_files, dtype=np.float64)
+            n_history = 0
+
+            n_unmasked = 0
+            for k in range(n_files):
+                if mask[i_row, i_col, k] == 0:
+                    n_unmasked += 1
+
+            while n_unmasked > 1:
+                # weighted average (1/yerr^2 weights)
+                sum_w = 0.0
+                sum_wy = 0.0
+                for k in range(n_files):
+                    if mask[i_row, i_col, k] != 0:
+                        continue
+                    if yerr[i_row, i_col, k] == 0.0:
+                        continue
+                    w = 1.0 / (yerr[i_row, i_col, k] ** 2)
+                    sum_w += w
+                    sum_wy += w * yval[i_row, i_col, k]
+                if sum_w > 0:
+                    yval_wgt = sum_wy / sum_w
+                    yerr_wgt = 1.0 / math.sqrt(sum_w)
+                else:
+                    break
+
+                history_y[n_history] = yval_wgt
+                history_e[n_history] = yerr_wgt
+                n_history += 1
+
+                # termination condition (maxdev_steps)
+                if maxdev_steps > 0 and n_history >= nsteps:
+                    term = True
+                    for istep in range(n_history - 1, n_history - nsteps - 1, -1):
+                        for jstep in range(istep - 1, n_history - nsteps - 1, -1):
+                            delta = abs(history_y[istep] - history_y[jstep])
+                            sigma = math.sqrt(history_e[istep] ** 2 + history_e[jstep] ** 2)
+                            if delta >= maxdev_steps * sigma:
+                                term = False
+                    if term:
+                        break
+
+                sort_index = np.argsort(neval)
+                ilow = 0
+                iupp = n_files - 1
+
+                while ilow < iupp:
+                    while ilow < n_files - 1:
+                        low = sort_index[ilow]
+                        if mask[i_row, i_col, low] == 0 and neval[low] != 0:
+                            break
+                        ilow += 1
+                    while iupp > 0:
+                        upp = sort_index[iupp]
+                        if mask[i_row, i_col, upp] == 0 and neval[upp] != 0:
+                            break
+                        iupp -= 1
+                    if ilow >= iupp:
+                        break
+
+                    low = sort_index[ilow]
+                    upp = sort_index[iupp]
+
+                    ntot_pair = neval[low] + neval[upp]
+                    yval_pair = (
+                        neval[low] * yval[i_row, i_col, low]
+                        + neval[upp] * yval[i_row, i_col, upp]
+                    ) / ntot_pair
+                    yerr_pair = (
+                        math.sqrt(
+                            neval[low] * yval[i_row, i_col, low] ** 2
+                            + neval[upp] * yval[i_row, i_col, upp] ** 2
+                            + (neval[low] * yerr[i_row, i_col, low]) ** 2
+                            + (neval[upp] * yerr[i_row, i_col, upp]) ** 2
+                            - ntot_pair * yval_pair ** 2
+                        )
+                        / ntot_pair
+                    )
+
+                    mask[i_row, i_col, low] = -(upp + 1)
+                    yval[i_row, i_col, low] = np.nan
+                    yval[i_row, i_col, upp] = yval_pair
+                    yerr[i_row, i_col, low] = np.nan
+                    yerr[i_row, i_col, upp] = yerr_pair
+                    neval[low] = 0
+                    neval[upp] = ntot_pair
+
+                    ilow += 1
+                    iupp -= 1
+
+                n_unmasked = 0
+                for k in range(n_files):
+                    if mask[i_row, i_col, k] == 0:
+                        n_unmasked += 1
 
 
 class NNLOJETHistogram:
@@ -1026,8 +1130,19 @@ class NNLOJETContainer:
             maxdev_steps = None
         if maxdev_unwgt is None and maxdev_steps is None:
             return
-            # raise ValueError("optimise_k termination condition missing")
 
+        # use numba-accelerated path when maxdev_unwgt is not used
+        if maxdev_unwgt is None and maxdev_steps is not None:
+            (n_rows, n_cols, n_files) = self._yval.shape
+            _kopt_inner(
+                self._yval, self._yerr, self._mask,
+                self._neval, n_rows, n_cols, n_files,
+                maxdev_steps, nsteps,
+            )
+            return
+
+        # fallback: Python path for maxdev_unwgt termination condition
+        # (requires self._merge_weighted_bin, so cannot be Numba-ified)
         # reference for termination is the unweighted combination
         if maxdev_unwgt is not None:
             ref_hist = self.merge()
