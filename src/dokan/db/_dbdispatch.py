@@ -207,12 +207,14 @@ class DBDispatch(DBTask):
                     #  break  # to get `tot_...` right, need to continue the loop
             qbreak = qbreak or qterm  # combine the two
             # > wait until # active jobs drops under max_concurrent with 25% buffer
-            if (tot_nact > tot_nque) and (tot_nact > 1.25 * self.config["run"]["jobs_max_concurrent"]):
+            # > only count jobs actually submitted to HTCondor (not QUEUED jobs in DB)
+            jobs_in_condor = tot_nact - tot_nque
+            if jobs_in_condor > 1.25 * self.config["run"]["jobs_max_concurrent"]:
                 self._logger(
                     session,
                     self._logger_prefix
                     + "::repopulate:  "
-                    + f"{tot_nact} v.s. {self.config['run']['jobs_max_concurrent']} -> sleeping",
+                    + f"{jobs_in_condor} jobs in HTCondor v.s. {self.config['run']['jobs_max_concurrent']} -> sleeping",
                 )
                 time.sleep(0.1 * self.config["run"]["job_max_runtime"])
                 continue
